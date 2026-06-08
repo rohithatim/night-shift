@@ -1,6 +1,9 @@
 const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
 const RESERVED_CODES = new Set(['api', 'assets', 'admin', 'health', 'favicon.ico'])
 const MAX_EVENTS_PER_LINK = 100
+const LINK_INDEX_KEY = 'shortline:links'
+const COUNTER_KEY = 'shortline:counter'
+const LINK_KEY_PREFIX = 'shortline:link:'
 
 const memoryStore = globalThis.__shortlineStore || {
   counter: 62 ** 5,
@@ -9,40 +12,49 @@ const memoryStore = globalThis.__shortlineStore || {
 }
 
 globalThis.__shortlineStore = memoryStore
+const durableStore = createDurableStore()
 
-export function handleShortlineRequest(req, res) {
-  const url = new URL(req.url || '/api', getRequestOrigin(req))
-  const segments = url.pathname.replace(/^\/api\/?/, '').split('/').filter(Boolean)
+export async function handleShortlineRequest(req, res) {
+  try {
+    const url = new URL(req.url || '/api', getRequestOrigin(req))
+    const segments = url.pathname.replace(/^\/api\/?/, '').split('/').filter(Boolean)
 
-  if (req.method === 'OPTIONS') {
-    res.statusCode = 204
-    return res.end()
-  }
+    if (req.method === 'OPTIONS') {
+      res.statusCode = 204
+      return res.end()
+    }
 
-  if (segments[0] === 'health' && req.method === 'GET') {
-    return sendJson(res, 200, {
-      ok: true,
-      links: Object.keys(memoryStore.links).length,
-      generatedIdsStartAt: encodeBase62(62 ** 5),
+    if (segments[0] === 'health' && req.method === 'GET') {
+      return sendJson(res, 200, {
+        ok: true,
+        storage: durableStore.type,
+        durable: durableStore.type !== 'memory',
+        links: (await durableStore.listLinks()).length,
+        generatedIdsStartAt: encodeBase62(62 ** 5),
+      })
+    }
+
+    if (segments[0] === 'links') {
+      return handleLinks(req, res, segments)
+    }
+
+    if (segments[0] === 'r' && segments[1] && req.method === 'GET') {
+      return redirectToLongUrl(req, res, segments[1])
+    }
+
+    return sendJson(res, 404, { error: 'API route not found.' })
+  } catch (error) {
+    return sendJson(res, 500, {
+      error: error instanceof Error ? error.message : 'Unexpected API error.',
     })
   }
-
-  if (segments[0] === 'links') {
-    return handleLinks(req, res, segments)
-  }
-
-  if (segments[0] === 'r' && segments[1] && req.method === 'GET') {
-    return redirectToLongUrl(req, res, segments[1])
-  }
-
-  return sendJson(res, 404, { error: 'API route not found.' })
 }
 
 async function handleLinks(req, res, segments) {
   const code = segments[1]
 
   if (segments.length === 1 && req.method === 'GET') {
-    const links = Object.values(memoryStore.links)
+    const links = (await durableStore.listLinks())
       .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
       .map((link) => publicLink(link, req))
 
@@ -50,6 +62,13 @@ async function handleLinks(req, res, segments) {
   }
 
   if (segments.length === 1 && req.method === 'POST') {
+    if (isVercelWithoutDurableStore()) {
+      return sendJson(res, 500, {
+        error:
+          'Short links need Vercel KV or Upstash Redis connected before they can work reliably on Vercel.',
+      })
+    }
+
     const rateLimitError = checkCreationRateLimit(req)
     if (rateLimitError) {
       return sendJson(res, 429, { error: rateLimitError })
@@ -71,8 +90,8 @@ async function handleLinks(req, res, segments) {
       return sendJson(res, 400, { error: expiryResult.error })
     }
 
-    const shortCode = aliasResult.alias || generateCode()
-    if (memoryStore.links[shortCode]) {
+    const shortCode = aliasResult.alias || (await generateCode())
+    if (await durableStore.getLink(shortCode)) {
       return sendJson(res, 409, { error: 'That short code is already taken.' })
     }
 
@@ -85,12 +104,12 @@ async function handleLinks(req, res, segments) {
       recentClicks: [],
     }
 
-    memoryStore.links[shortCode] = link
+    await durableStore.setLink(shortCode, link)
     return sendJson(res, 201, { link: publicLink(link, req) })
   }
 
   if (segments.length === 2 && req.method === 'GET') {
-    const link = memoryStore.links[code]
+    const link = await durableStore.getLink(code)
     if (!link) {
       return sendJson(res, 404, { error: 'Short URL not found.' })
     }
@@ -99,11 +118,11 @@ async function handleLinks(req, res, segments) {
   }
 
   if (segments.length === 2 && req.method === 'DELETE') {
-    if (!memoryStore.links[code]) {
+    if (!(await durableStore.getLink(code))) {
       return sendJson(res, 404, { error: 'Short URL not found.' })
     }
 
-    delete memoryStore.links[code]
+    await durableStore.deleteLink(code)
     res.statusCode = 204
     return res.end()
   }
@@ -111,12 +130,12 @@ async function handleLinks(req, res, segments) {
   return sendJson(res, 405, { error: 'Method not allowed.' })
 }
 
-function redirectToLongUrl(req, res, code) {
+async function redirectToLongUrl(req, res, code) {
   if (!/^[A-Za-z0-9_-]{1,64}$/.test(code)) {
     return sendMessage(res, 404, 'Short link not found')
   }
 
-  const link = memoryStore.links[code]
+  const link = await durableStore.getLink(code)
   if (!link) {
     return sendMessage(res, 404, 'Short link not found')
   }
@@ -133,6 +152,7 @@ function redirectToLongUrl(req, res, code) {
     referrer: req.headers.referer || 'direct',
   })
   link.recentClicks = link.recentClicks.slice(0, MAX_EVENTS_PER_LINK)
+  await durableStore.setLink(code, link)
 
   res.statusCode = 302
   res.setHeader('Location', link.longUrl)
@@ -169,13 +189,13 @@ function encodeBase62(value) {
   return encoded || '0'
 }
 
-function generateCode() {
+async function generateCode() {
   let code = ''
 
   do {
-    code = encodeBase62(memoryStore.counter)
-    memoryStore.counter += 1
-  } while (memoryStore.links[code] || RESERVED_CODES.has(code.toLowerCase()))
+    const nextCounter = await durableStore.nextCounter()
+    code = encodeBase62(nextCounter)
+  } while ((await durableStore.getLink(code)) || RESERVED_CODES.has(code.toLowerCase()))
 
   return code
 }
@@ -323,6 +343,133 @@ function getClientIp(req) {
     return forwarded.split(',')[0].trim()
   }
   return req.socket?.remoteAddress || 'unknown'
+}
+
+function createDurableStore() {
+  const restUrl = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL
+  const restToken = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN
+
+  if (restUrl && restToken) {
+    return createRedisRestStore(restUrl, restToken)
+  }
+
+  return createMemoryStore()
+}
+
+function isVercelWithoutDurableStore() {
+  return process.env.VERCEL === '1' && durableStore.type === 'memory'
+}
+
+function createMemoryStore() {
+  return {
+    type: 'memory',
+    async listLinks() {
+      return Object.values(memoryStore.links)
+    },
+    async getLink(code) {
+      return memoryStore.links[code] || null
+    },
+    async setLink(code, link) {
+      memoryStore.links[code] = link
+    },
+    async deleteLink(code) {
+      delete memoryStore.links[code]
+    },
+    async nextCounter() {
+      const counter = memoryStore.counter
+      memoryStore.counter += 1
+      return counter
+    },
+  }
+}
+
+function createRedisRestStore(restUrl, restToken) {
+  return {
+    type: 'redis-rest',
+    async listLinks() {
+      const codes = await redisCommand(restUrl, restToken, ['SMEMBERS', LINK_INDEX_KEY])
+      if (!Array.isArray(codes) || codes.length === 0) {
+        return []
+      }
+
+      const values = await redisPipeline(
+        restUrl,
+        restToken,
+        codes.map((code) => ['GET', linkKey(code)]),
+      )
+
+      return values
+        .map((entry) => parseStoredLink(entry.result))
+        .filter(Boolean)
+    },
+    async getLink(code) {
+      return parseStoredLink(await redisCommand(restUrl, restToken, ['GET', linkKey(code)]))
+    },
+    async setLink(code, link) {
+      await redisPipeline(restUrl, restToken, [
+        ['SET', linkKey(code), JSON.stringify(link)],
+        ['SADD', LINK_INDEX_KEY, code],
+      ])
+    },
+    async deleteLink(code) {
+      await redisPipeline(restUrl, restToken, [
+        ['DEL', linkKey(code)],
+        ['SREM', LINK_INDEX_KEY, code],
+      ])
+    },
+    async nextCounter() {
+      const value = await redisCommand(restUrl, restToken, ['INCR', COUNTER_KEY])
+      return Number(value) + 62 ** 5
+    },
+  }
+}
+
+async function redisCommand(restUrl, restToken, command) {
+  const response = await fetch(restUrl, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${restToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(command),
+  })
+  const payload = await response.json()
+
+  if (!response.ok || payload.error) {
+    throw new Error(payload.error || 'Redis REST command failed.')
+  }
+
+  return payload.result
+}
+
+async function redisPipeline(restUrl, restToken, commands) {
+  const response = await fetch(`${restUrl.replace(/\/$/, '')}/pipeline`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${restToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(commands),
+  })
+  const payload = await response.json()
+
+  if (!response.ok || payload.error) {
+    throw new Error(payload.error || 'Redis REST pipeline failed.')
+  }
+
+  return payload
+}
+
+function parseStoredLink(value) {
+  if (!value) {
+    return null
+  }
+
+  return typeof value === 'string' ? JSON.parse(value) : value
+}
+
+function linkKey(code) {
+  return `${LINK_KEY_PREFIX}${code}`
 }
 
 function sendJson(res, statusCode, payload) {

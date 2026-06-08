@@ -45,6 +45,26 @@ npm run dev
 
 Open `http://localhost:5173`.
 
+## Vercel Deployment
+
+Vercel functions are serverless, so in-memory data can disappear between requests. For short links to keep working on `*.vercel.app` domains, connect a Vercel KV / Upstash Redis store to the project.
+
+Required environment variables:
+
+```bash
+KV_REST_API_URL
+KV_REST_API_TOKEN
+```
+
+The API also supports the equivalent Upstash names:
+
+```bash
+UPSTASH_REDIS_REST_URL
+UPSTASH_REDIS_REST_TOKEN
+```
+
+After adding the store, redeploy the project. `GET /api/health` should return `"durable": true`.
+
 ## API
 
 `POST /api/links`
