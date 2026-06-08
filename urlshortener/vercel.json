@@ -1,0 +1,9 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "rewrites": [
+    {
+      "source": "/:code([A-Za-z0-9_-]{3,64})",
+      "destination": "/api/r/:code"
+    }
+  ]
+}
